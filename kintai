@@ -1,0 +1,79 @@
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import os
+import psycopg2
+import datetime
+
+# LINE Developersのチャネルシークレットとチャネルアクセストークンを環境変数から取得する
+CHANNEL_SECRET = os.environ['LINE_CHANNEL_SECRET']
+CHANNEL_ACCESS_TOKEN = os.environ['LINE_CHANNEL_ACCESS_TOKEN']
+
+# LINE Messaging API SDKの初期化
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
+
+# PostgreSQLに接続する
+DATABASE_URL = os.environ['DATABASE_URL']
+conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+cur = conn.cursor()
+
+# Flaskアプリケーションの初期化
+app = Flask(__name__)
+
+# LINE Messaging APIからのリクエストを受け取るエンドポイント
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    return 'OK'
+
+# 「出勤」「退勤」などのメッセージを受信した際に呼び出されるハンドラー
+@handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    user_id = event.source.user_id
+    message_text = event.message.text
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if message_text == '出勤':
+        cur.execute("INSERT INTO attendance (user_id, status, timestamp) VALUES (%s, %s, %s)", (user_id, '出勤', timestamp))
+        conn.commit()
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text='出勤しました'))
+# 勤怠情報を閲覧・編集するためのページ
+@app.route('/attendance')
+def attendance():
+    cur.execute("SELECT * FROM attendance")
+    rows = cur.fetchall()
+    html = '<table><tr><th>User ID</th><th>Status</th><th>Timestamp</th></tr>'
+    for row in rows:
+        html += '<tr><td>{}</td><td>{}</td><td>{}</td></tr>'.format(row[0], row[1], row[2])
+    html += '</table>'
+    return html
+
+# 勤怠情報を編集するためのページ
+@app.route('/edit_attendance')
+def edit_attendance():
+    user_id = request.args.get('user_id')
+    cur.execute("SELECT * FROM attendance WHERE user_id=%s", (user_id,))
+    rows = cur.fetchall()
+    html = '<table><tr><th>Status</th><th>Timestamp</th></tr>'
+    for row in rows:
+        html += '<tr><td><input type="text" name="status" value="{}"></td><td>{}</td></tr>'.format(row[1], row[2])
+    html += '</table><input type="submit" value="更新">'
+    return '<form method="post" action="/update_attendance?user_id={}">'.format(user_id) + html + '</form>'
+
+# 勤怠情報を更新するためのエンドポイント
+@app.route('/update_attendance', methods=['POST'])
+def update_attendance():
+    user_id = request.args.get('user_id')
+    status = request.form['status']
+    cur.execute("UPDATE attendance SET status=%s WHERE user_id=%s", (status, user_id))
+    conn.commit()
+    return '更新しました'
+
+if __name__ == "__main__":
+    app.run()
